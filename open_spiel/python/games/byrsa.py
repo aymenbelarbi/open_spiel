@@ -357,7 +357,8 @@ class ByrsaState(pyspiel.State):
     def information_state_string(self, player=None):
         if player is None:
             player = self.current_player()
-        return _info_string(self._st, player, self._history_str)
+        return _info_string(self._st, player, self._history_str,
+                            self._phase, self._running_total)
 
     def observation_string(self, player=None):
         return self.information_state_string(player)
@@ -369,16 +370,52 @@ class ByrsaState(pyspiel.State):
                 f"phase={'PLEDGE' if self._phase == _PHASE_PLEDGE else 'RESCUE'}")
 
 
-def _info_string(st, player, history):
-    """Only what A1 §2 lets this seat see."""
+def _info_string(st, player, history, phase=_PHASE_PLEDGE, running_total=0):
+    """Only what A1 §2 lets this seat see -- and ALL of it.
+
+    Both halves of that sentence are load-bearing, and only the first one is
+    obvious.  Writing a fact this seat may not see is a leak.  OMITTING a fact
+    the whole table CAN see is a different bug and a subtler one: OpenSpiel
+    keys search nodes by this string, so any public fact that changes the legal
+    action set and is not written here makes two genuinely different nodes
+    collide.  ISMCTS then indexes a prior map built for one of them with an
+    action that is legal only in the other -- ``KeyError`` in
+    ``ismcts.py::expand_if_necessary``, which is exactly how this was found.
+
+    ``action_space.legal_actions`` reads exactly four things: the **phase**,
+    the seat's **hand**, the **printed Crisis cost** (``fair_share``), and, in
+    the Rescue lap, the **gap**.  Every one is public or own-hand; every one
+    appears below.  Three of the four used to be missing.
+
+    Each addition is checked against A1 §2 before it is written:
+      * phase        -- the table plainly knows whether it is pledging or
+                        rescuing; A2 §3 names the steps out loud.
+      * crisis       -- A1 §2 "Crisis deck order: Hidden ... Reveal trigger:
+                        Step 2 each round".  The FLIPPED Crisis is public;
+                        only the unflipped ORDER is hidden, and that is not
+                        here.
+      * need / tot   -- A2 §8, verbatim: *"Rescue additions are public and
+                        immediate; the running total is announced."*
+      * pledged      -- A2 §3, the Flip: "all pledges are revealed
+                        simultaneously".  Public from the Rescue lap onward,
+                        and identically zero for every seat before it, so the
+                        sealed commit publishes nothing.  That last clause is
+                        not an argument, it is what
+                        ``scripts/verify_turnbased_no_leak.py`` measures.
+    """
     if player is None or player < 0:
         return " | ".join(history[-4:])
     obs = byrsa_obs.build(st, player, "info")
     return (f"seat={player} r={st.round} "
+            f"phase={'PLEDGE' if phase == _PHASE_PLEDGE else 'RESCUE'} "
+            f"crisis={obs.crisis_family}/{obs.crisis_cost}"
+            f"{'/SIEGE' if obs.crisis_is_siege else ''} "
+            f"need={obs.total_cost} tot={running_total} "
             f"hand={sorted(obs.hand)} "
             f"backs={[list(x) for x in obs.hand_suit_counts]} "
             f"sizes={list(obs.hand_sizes)} "
             f"claims={[sum(1 for _ in c) for c in obs.claims]} "
+            f"pledged={list(obs.pledged_values)} "
             f"pillars={''.join('1' if x else '0' for x in obs.pillars)} "
             f"| " + " ".join(history[-4:]))
 
