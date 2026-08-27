@@ -46,11 +46,27 @@ game and the RLCard env decode an action index to exactly the same cards --
 without which E-12's cross-harness comparison would be measuring decode
 differences rather than rules differences.
 
-Chance -- ``SAMPLED_STOCHASTIC``, not the ``EXPLICIT_STOCHASTIC`` sketched in
-00 §5.  The deal is one card of each suit to each player from four shuffled
-piles (A2 §2.2); enumerating those outcomes explicitly is not feasible, and
-byrsa_sim owns all randomness behind a seeded RNG anyway.  The ``seed``
-parameter makes a game reproducible, which is what E-12 actually needs.
+Chance -- ``DETERMINISTIC``, and the reason is worth stating because it is not
+the obvious choice.
+
+00 §5 sketched ``EXPLICIT_STOCHASTIC``, copied from
+``iterated_prisoners_dilemma``, whose only chance event is a two-way
+continue/stop.  BYRSA's setup deals one card of each suit to each player from
+four shuffled piles (A2 §2.2); those outcomes cannot be enumerated.
+
+``SAMPLED_STOCHASTIC`` was the next candidate and is WRONG here for a concrete
+reason: pyspiel requires ``GetRNGState``/``SetRNGState`` for a sampled-stochastic
+game, a Python game cannot supply them (the C++ base raises before consulting
+Python), and without them ``state.clone()`` throws -- which disables ISMCTS,
+MCTS, CFR and essentially every OpenSpiel algorithm that searches.
+
+``DETERMINISTIC`` is the accurate declaration for what this class actually
+exposes.  The ``seed`` parameter pins the deal and every draw, so the game tree
+of a given ``python_byrsa(seed=K)`` instance contains **no chance nodes at
+all**: ``current_player()`` never returns CHANCE and ``chance_outcomes()`` is
+never called.  BYRSA's real chance lives in the choice of seed -- i.e. across
+instances, which is exactly how every experiment in this workspace uses it, and
+what makes E-12's exact cross-harness reproduction possible.
 """
 
 import random
@@ -66,7 +82,10 @@ from byrsa_sim.config import Config
 _DEFAULT_PARAMS = {
     "players": 5,
     "seed": 0,
-    "delegate": "BeliefBot(0.5)",
+    # Parenthesis-free ON PURPOSE: OpenSpiel round-trips game parameters
+    # through its game-string parser on clone(), and "BeliefBot(0.5)" parses as
+    # a NESTED GAME.  byrsa_sim.agents.registry accepts this colon spelling.
+    "delegate": "BeliefBot:0.5",
     "rounds": 6,
     "decrees": True,
     "ambitions": True,
@@ -82,7 +101,7 @@ _GAME_TYPE = pyspiel.GameType(
     short_name="python_byrsa",
     long_name="Python BYRSA",
     dynamics=pyspiel.GameType.Dynamics.SIMULTANEOUS,
-    chance_mode=pyspiel.GameType.ChanceMode.SAMPLED_STOCHASTIC,
+    chance_mode=pyspiel.GameType.ChanceMode.DETERMINISTIC,
     information=pyspiel.GameType.Information.IMPERFECT_INFORMATION,
     utility=pyspiel.GameType.Utility.GENERAL_SUM,
     reward_model=pyspiel.GameType.RewardModel.TERMINAL,
@@ -191,7 +210,16 @@ class _ScriptedPledge:
 
     # -- everything else is the delegate's ---------------------------------
     def __getattr__(self, item):
-        return getattr(self._d, item)
+        # `copy.deepcopy` and pickle probe for __deepcopy__, __reduce_ex__,
+        # __getstate__ &c BEFORE __init__ has run, so a naive
+        # `getattr(self._d, item)` asks for `_d`, which re-enters __getattr__,
+        # which asks for `_d`... -> RecursionError, and clone() dies with it.
+        if item.startswith("__") or item == "_d":
+            raise AttributeError(item)
+        try:
+            return getattr(self.__dict__["_d"], item)
+        except KeyError:
+            raise AttributeError(item) from None
 
 
 class ByrsaState(pyspiel.State):
