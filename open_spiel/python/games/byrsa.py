@@ -94,8 +94,17 @@ _DEFAULT_PARAMS = {
     "envoy": True,
 }
 
+# RULING 12 (v3 1.4): the Envoy declaration is its own SEQUENTIAL phase, ahead
+# of the simultaneous node.  A2 §6 makes the Envoy a public act declared before
+# any pledge; resolving it inside the Flip -- as v2 did -- hides it from every
+# solver, so ISMCTS could never choose it and E-20(a) would report a robustness
+# number for a game missing one of its two verbs.
+_PHASE_ENVOY = 2
 _PHASE_PLEDGE = 0
 _PHASE_RESCUE = 1
+
+_PHASE_NAMES = {_PHASE_PLEDGE: "PLEDGE", _PHASE_RESCUE: "RESCUE",
+                _PHASE_ENVOY: "ENVOY"}
 
 _GAME_TYPE = pyspiel.GameType(
     short_name="python_byrsa",
@@ -140,7 +149,7 @@ class ByrsaGame(pyspiel.Game):
         super().__init__(
             _GAME_TYPE,
             pyspiel.GameInfo(
-                num_distinct_actions=action_space.NUM_ACTIONS,
+                num_distinct_actions=action_space.NUM_DISTINCT_ACTIONS,
                 max_chance_outcomes=0,
                 num_players=n,
                 min_utility=0.0,
@@ -191,6 +200,23 @@ class _ScriptedPledge:
     def script_rescue(self, cards):
         self._rescue = tuple(cards)
 
+    def clear_script(self):
+        """Discard any scripted move the engine did not consume.
+
+        A2 §6 makes the Envoy *instead of* pledging, so ``rules.step_pledge``
+        never calls ``pledge()`` on a seat that declared -- and a script left
+        sitting in ``_cards`` is then consumed by the NEXT caller, which is
+        Step 5's D01 Rebuild.  That is a live bug, not a theoretical one: it
+        cost 2 of 40 games at 6p in the G-W5 declaring arm, where the two
+        wrappers agreed with each other and both differed from the engine.
+
+        It was unreachable until v3, because no bot in the reconciliation ever
+        declared: BucketBot is the roster's one deliberate non-declarer and
+        every other bot only gained a legal Envoy in M3.
+        """
+        self._cards = None
+        self._rescue = None
+
     def reset(self, seat, rng):
         self.seat = seat
         self.rng = rng
@@ -207,6 +233,12 @@ class _ScriptedPledge:
             return self._d.rescue(obs)
         cards, self._rescue = self._rescue, None
         return tuple(c for c in cards if c in obs.hand)
+
+    # declare_envoy is deliberately NOT scripted.  Under ruling 12 OpenSpiel
+    # takes the declaration as an action and writes it straight into the state,
+    # and ``step_pledge(prelude_done=True)`` never asks an agent; under the v2
+    # flag the sealed commit asks, and __getattr__ forwards to the delegate.
+    # A scripted copy would be dead in one path and redundant in the other.
 
     # -- everything else is the delegate's ---------------------------------
     def __getattr__(self, item):
@@ -241,23 +273,57 @@ class ByrsaState(pyspiel.State):
         self._phase = _PHASE_PLEDGE
         self._rescue_order = []
         self._rescue_idx = 0
+        self._envoy_order = []
+        self._envoy_idx = 0
         self._running_total = 0
         self._returns = None
         self._history_str = []
         rules.begin_round(self._st, self._agents)
+        self._open_pledge()
+
+    def _open_pledge(self):
+        """Step 3's discussion window, then RULING 12's declaration lap.
+
+        ``rules.pledge_window`` is called rather than re-implemented: the
+        Notable window and U7 Silver League both change a hand, and a seat that
+        declares before its draw-2 is deciding on different information than
+        one that declares after.  The lap itself becomes real actions here, so
+        ``step_pledge`` is later told the prelude is done.
+        """
+        rules.pledge_window(self._st, self._agents)
+        if not self._st.config.envoy_declared_before_commit:
+            self._phase = _PHASE_PLEDGE
+            return
+        # The order comes from the ENGINE: one definition of who is offered
+        # the Envoy and in what order, shared by the native lap and both
+        # wrappers.  Seats that may not declare are absent rather than handed a
+        # forced pass -- a one-action node is not a decision, and it would
+        # inflate the tree ISMCTS searches in E-20(a).  Duplicating
+        # "(sufet + i) % n, if eligible" in three files is how the Steps 4-5
+        # drift happened.
+        self._envoy_order = rules.envoy_declaration_order(self._st)
+        self._envoy_idx = 0
+        self._phase = _PHASE_ENVOY if self._envoy_order else _PHASE_PLEDGE
 
     # ---- OpenSpiel API --------------------------------------------------
     def current_player(self):
         if self._st.game_over:
             return pyspiel.PlayerId.TERMINAL
+        if self._phase == _PHASE_ENVOY:
+            # A2 §6: declared in Sufet-clockwise order, one seat at a time,
+            # each declaration visible to the seats that follow.
+            return self._envoy_order[self._envoy_idx]
         if self._phase == _PHASE_PLEDGE:
             # THE FLIP: every seat commits at once, sealed until reveal.
             return pyspiel.PlayerId.SIMULTANEOUS
         return self._rescue_order[self._rescue_idx]
 
+    _PHASE_TO_NAME = {_PHASE_PLEDGE: "pledge", _PHASE_RESCUE: "rescue",
+                      _PHASE_ENVOY: "envoy"}
+
     def _legal_actions(self, player):
         assert player >= 0
-        phase = "pledge" if self._phase == _PHASE_PLEDGE else "rescue"
+        phase = self._PHASE_TO_NAME[self._phase]
         obs = self._obs(player, phase)
         return action_space.legal_actions(obs, phase)
 
@@ -265,6 +331,8 @@ class ByrsaState(pyspiel.State):
         extra = {}
         if phase == "rescue":
             extra["gap"] = max(0, self._st.cost - self._running_total)
+        if phase == "envoy":
+            phase = "envoy_declare"      # the name byrsa_sim.rules builds with
         return byrsa_obs.build(self._st, player, phase, **extra)
 
     def _apply_actions(self, actions):
@@ -282,7 +350,9 @@ class ByrsaState(pyspiel.State):
         self._history_str.append(
             "P:" + ",".join(action_space.ACTION_NAMES[int(a)] for a in actions))
 
-        total = rules.step_pledge(self._st, self._agents)
+        total = rules.step_pledge(self._st, self._agents, prelude_done=True)
+        for a in self._agents:
+            a.clear_script()
         self._running_total = total
         if total >= self._st.cost:
             self._finish_round()
@@ -294,19 +364,39 @@ class ByrsaState(pyspiel.State):
         self._rescue_idx = 0
 
     def _apply_action(self, action):
-        """One seat's Rescue turn -- a genuinely sequential phase where
-        current_player() returns a real seat (00 §5)."""
+        """One seat's turn in a sequential phase -- the Envoy declaration lap
+        (RULING 12) or the Rescue lap.  Both return a real seat from
+        current_player() (00 §5)."""
+        if self._phase == _PHASE_ENVOY:
+            return self._apply_envoy(int(action))
         assert self._phase == _PHASE_RESCUE and not self._st.game_over
         p = self._rescue_order[self._rescue_idx]
         obs = self._obs(p, "rescue")
         self._agents[p].script_rescue(action_space.decode_rescue(obs, int(action)))
         self._running_total = rules.rescue_one(
             self._st, self._agents, p, self._running_total)
+        self._agents[p].clear_script()
         self._history_str.append(f"R{p}:{action_space.ACTION_NAMES[int(action)]}")
         self._rescue_idx += 1
         if (self._rescue_idx >= len(self._rescue_order)
                 or self._running_total >= self._st.cost):
             self._finish_round()
+
+    def _apply_envoy(self, action):
+        """One seat's declaration, written into the state IMMEDIATELY so the
+        next seat's observation carries it -- that visibility is the whole
+        point of ruling 12."""
+        assert self._phase == _PHASE_ENVOY and not self._st.game_over
+        p = self._envoy_order[self._envoy_idx]
+        declared = (action == action_space.DECLARE_ENVOY)
+        assert not declared or rules.may_declare_envoy(self._st, p), (
+            "DECLARE_ENVOY offered to a seat that may not declare")
+        self._st.envoy_declared[p] = declared
+        self._history_str.append(
+            f"E{p}:{action_space.ACTION_NAMES[action]}")
+        self._envoy_idx += 1
+        if self._envoy_idx >= len(self._envoy_order):
+            self._phase = _PHASE_PLEDGE
 
     def _finish_round(self):
         """Steps 3c-5 and the next round, all inside byrsa_sim.rules."""
@@ -326,8 +416,8 @@ class ByrsaState(pyspiel.State):
             self._returns = [float(x) for x in res["totals"]]
         else:
             rules.begin_round(st, ag)
-            self._phase = _PHASE_PLEDGE
             self._running_total = 0
+            self._open_pledge()
 
     def _action_to_string(self, player, action):
         return action_space.ACTION_NAMES[int(action)]
@@ -364,7 +454,7 @@ class ByrsaState(pyspiel.State):
         st = self._st
         return (f"BYRSA r{st.round}/{st.max_rounds} "
                 f"pillars={''.join('1' if x else '0' for x in st.pillars)} "
-                f"phase={'PLEDGE' if self._phase == _PHASE_PLEDGE else 'RESCUE'}")
+                f"phase={_PHASE_NAMES[self._phase]}")
 
 
 def _info_string(st, player, history, phase=_PHASE_PLEDGE, running_total=0):
@@ -404,7 +494,7 @@ def _info_string(st, player, history, phase=_PHASE_PLEDGE, running_total=0):
         return " | ".join(history[-4:])
     obs = byrsa_obs.build(st, player, "info")
     return (f"seat={player} r={st.round} "
-            f"phase={'PLEDGE' if phase == _PHASE_PLEDGE else 'RESCUE'} "
+            f"phase={_PHASE_NAMES.get(phase, phase)} "
             f"crisis={obs.crisis_family}/{obs.crisis_cost}"
             f"{'/SIEGE' if obs.crisis_is_siege else ''} "
             f"need={obs.total_cost} tot={running_total} "
@@ -413,6 +503,8 @@ def _info_string(st, player, history, phase=_PHASE_PLEDGE, running_total=0):
             f"sizes={list(obs.hand_sizes)} "
             f"claims={[sum(1 for _ in c) for c in obs.claims]} "
             f"pledged={list(obs.pledged_values)} "
+            f"envoys={''.join('1' if x else '0' for x in obs.envoy_declared_this_round)} "
+            f"maydeclare={int(bool(obs.may_declare_envoy))} "
             f"pillars={''.join('1' if x else '0' for x in obs.pillars)} "
             f"| " + " ".join(history[-4:]))
 
