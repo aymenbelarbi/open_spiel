@@ -312,18 +312,15 @@ class ByrsaState(pyspiel.State):
         """Steps 3c-5 and the next round, all inside byrsa_sim.rules."""
         st, ag = self._st, self._agents
         contained = self._running_total >= st.cost
+        st.siege_total = self._running_total   # the graded Siege reads this
         rules.step_resolution(st, ag, contained)
         if st.standing == 0:
             st.destroyed = True
             st.game_over = True
-        if not st.game_over:
-            rules.step_sufet(st, ag)
-        st.forbidden_suit = -1
-        st.required_suit = -1
-        if not st.game_over:
-            rules.step_decree(st, ag)
-        if st.round >= st.max_rounds:
-            st.game_over = True
+        # Steps 4 and 5 live in byrsa_sim.rules, not here.  This block used to
+        # duplicate them, so RULING 10 (no Sufet/Decree in the last round)
+        # landed natively and not in OpenSpiel, and G-W5 diverged on seed 7.
+        rules.steps_4_and_5(st, ag)
         if st.game_over:
             res = rules.score(st)
             self._returns = [float(x) for x in res["totals"]]
