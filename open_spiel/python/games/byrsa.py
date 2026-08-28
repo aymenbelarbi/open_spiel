@@ -86,6 +86,19 @@ _DEFAULT_PARAMS = {
     # through its game-string parser on clone(), and "BeliefBot(0.5)" parses as
     # a NESTED GAME.  byrsa_sim.agents.registry accepts this colon spelling.
     "delegate": "BeliefBot:0.5",
+    # PER-SEAT delegates, pipe-separated, for a MIXED profile (v3 4.13).
+    # EGTA's whole object is a profile in which seats play DIFFERENT
+    # strategies, and a wrapper that can only seat one policy cannot replay one
+    # at all: the pledges could be scripted from outside, but Notables,
+    # Ballots, flip-buy and the Sufet's choices would all be made by seat 0's
+    # bot.  That diverged from the engine in 5 of 40 games on the first mixed
+    # profile tried.
+    #
+    # Pipe, not comma or parenthesis: both of those are structural in
+    # OpenSpiel's game-string parser, which every parameter is round-tripped
+    # through on clone().  Semicolons are already the within-spec separator
+    # (registry.make), so a seat list needs a third character.
+    "delegates": "",
     "rounds": 6,
     "decrees": True,
     "ambitions": True,
@@ -146,6 +159,7 @@ class ByrsaGame(pyspiel.Game):
         )
         self._seed = int(params["seed"])
         self._delegate = str(params["delegate"])
+        self._delegates_param = str(params.get("delegates", "") or "")
         super().__init__(
             _GAME_TYPE,
             pyspiel.GameInfo(
@@ -164,6 +178,20 @@ class ByrsaGame(pyspiel.Game):
     @property
     def config(self):
         return self._config
+
+    @property
+    def delegate_specs(self):
+        """One spec per seat.  Falls back to `delegate` repeated when the
+        `delegates` parameter is empty, so every existing caller is unchanged."""
+        raw = self._delegates_param.strip()
+        if not raw:
+            return [self._delegate] * self._config.players
+        out = [x.strip() for x in raw.split("|") if x.strip()]
+        if len(out) != self._config.players:
+            raise ValueError(
+                f"`delegates` names {len(out)} seats but the game has "
+                f"{self._config.players}: {raw!r}")
+        return out
 
     @property
     def delegate_spec(self):
@@ -263,7 +291,7 @@ class ByrsaState(pyspiel.State):
         self._rng = random.Random(seed)
         cfg = game.config
         self._st = rules.setup(cfg, self._rng)
-        self._delegates = [registry.make(game.delegate_spec) for _ in range(cfg.players)]
+        self._delegates = [registry.make(sp) for sp in game.delegate_specs]
         self._agents = [_ScriptedPledge(d) for d in self._delegates]
         # rules.bind_agents is the CANONICAL seeding recipe, shared by all three
         # harnesses.  Deriving agent RNGs from self._rng would advance the game
