@@ -105,6 +105,25 @@ _DEFAULT_PARAMS = {
     "houses": True,
     "notables": True,
     "envoy": True,
+    # THE COST ROW AND THE SIEGE, which this wrapper did not carry.
+    #
+    # Every rule the battery actually varies lives here: E-15 bisects
+    # `cost_low`/`cost_high` per count and E-14 chose `siege_mode` and
+    # `siege_pillars`, and without them the wrapper could only ever play the
+    # ENACTED game.  That is not a small gap -- it is why E-20 (a), the
+    # ISMCTS-in-every-seat check on the grid itself, was reported for three
+    # sessions as impossible at the calibrated row and written into the audit
+    # as a permanent limitation.  It was ten lines.
+    #
+    # `siege_mode` is a string, spelled like `delegate`: OpenSpiel round-trips
+    # every parameter through its game-string parser on clone(), and the three
+    # legal values ("fells_k", "destroy", "graded") carry no parenthesis or
+    # comma, so they survive it unchanged.
+    "cost_low": 6,                     # A3 §2 enacted
+    "cost_high": 9,
+    "siege_cost": 12,
+    "siege_pillars": 2,                # k for siege_mode="fells_k"
+    "siege_mode": "fells_k",
 }
 
 # RULING 12 (v3 1.4): the Envoy declaration is its own SEQUENTIAL phase, ahead
@@ -156,6 +175,11 @@ class ByrsaGame(pyspiel.Game):
             houses=bool(params["houses"]),
             notables=bool(params["notables"]),
             envoy=bool(params["envoy"]),
+            cost_low=int(params["cost_low"]),
+            cost_high=int(params["cost_high"]),
+            siege_cost=int(params["siege_cost"]),
+            siege_pillars=int(params["siege_pillars"]),
+            siege_mode=str(params["siege_mode"]),
         )
         self._seed = int(params["seed"])
         self._delegate = str(params["delegate"])
